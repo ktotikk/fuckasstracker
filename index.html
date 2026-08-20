@@ -211,7 +211,14 @@ const procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
 // rendering responsive even while a (CPU, ~150-350ms) inference call is in
 // flight, instead of freezing the whole page for that duration.
 // ---------------------------------------------------------------------------
-const worker = new Worker('./segmenter.worker.js', { type: 'module' });
+// NOTE: must be a classic worker (no `{ type: 'module' }`) — see the comment
+// at the top of segmenter.worker.js for why. Module workers can't call
+// importScripts(), which MediaPipe's bundle relies on internally.
+const worker = new Worker('./segmenter.worker.js');
+worker.onerror = (e) => {
+  loadStatus.textContent = `Ошибка воркера: ${e.message || 'см. консоль'}`;
+  console.error('Worker onerror:', e);
+};
 let workerReady = false;
 let simdSupported = null;
 let pendingReqId = 0;

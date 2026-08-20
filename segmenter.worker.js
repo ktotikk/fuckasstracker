@@ -1,13 +1,21 @@
 // segmenter.worker.js
-// Runs MediaPipe InteractiveSegmenter off the main thread so the UI (drag,
-// button taps, HUD animation) never freezes while a segmentation call is
-// in flight. The main thread sends an ImageBitmap (cheap to transfer) plus
-// the normalized click point; this worker returns the parsed mask bounds.
+// IMPORTANT: this must be a CLASSIC worker (no `{ type: 'module' }` when
+// constructed on the main thread), NOT a module worker. MediaPipe's browser
+// bundle internally calls importScripts() to load its WASM loader/runtime,
+// and importScripts() throws "Module scripts don't support importScripts()"
+// inside a module-type worker. Classic workers support importScripts()
+// natively (including cross-origin, e.g. from a CDN), which is what makes
+// this actually work — this was the root cause of "worker: ..." never
+// reaching "ready" and every capture failing with a null result.
+//
+// We load the global (non-ESM) build of tasks-vision, which attaches its
+// exports directly onto the worker's global scope (self), rather than using
+// `import { ... } from "...tasks-vision"` like the main-thread code does.
 
-import {
-  FilesetResolver,
-  InteractiveSegmenter
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+importScripts('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.js');
+
+// The global bundle exposes its named exports directly on self.
+const { FilesetResolver, InteractiveSegmenter } = self;
 
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/1/magic_touch.tflite";
 
@@ -23,11 +31,10 @@ async function init(){
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
   );
 
-  // GPU delegate is intentionally NOT used here: it has been observed to
-  // return corrupted/scrambled category mask values on some devices (the
-  // whole frame reads back as a single category), which silently breaks
-  // capture. CPU delegate is slower but returns correct results, and SIMD
-  // (auto-detected above) is the safe speed lever we actually rely on.
+  // GPU delegate is intentionally NOT used: it has been observed to return
+  // corrupted/scrambled category mask values on some devices (the whole
+  // frame reads back as a single category), which silently breaks capture.
+  // CPU delegate is slower but returns correct results.
   segmenter = await InteractiveSegmenter.createFromOptions(vision, {
     baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
     outputCategoryMask: true,
@@ -98,13 +105,13 @@ self.onmessage = async (e) => {
     try {
       await init();
     } catch (err){
-      postMessage({ type: 'error', error: String(err) });
+      postMessage({ type: 'error', error: String(err && err.message || err) });
     }
   } else if (msg.type === 'segment'){
     try {
       await runSegmentation(msg.bitmap, msg.normX, msg.normY, msg.reqId);
     } catch (err){
-      postMessage({ type: 'result', reqId: msg.reqId, info: null, error: String(err) });
+      postMessage({ type: 'result', reqId: msg.reqId, info: null, error: String(err && err.message || err) });
     }
   }
 };
