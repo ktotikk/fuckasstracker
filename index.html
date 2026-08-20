@@ -213,6 +213,32 @@ let trackRAF = null;
 let lastRunTime = 0;
 const RUN_INTERVAL_MS = 220; // throttle segmentation calls for perf
 
+// --- Stability guards against the segmenter locking onto a different object ---
+// Max allowed center jump between consecutive tracking updates, as a fraction
+// of the current box's diagonal size. A legit tracked object moves smoothly;
+// a big jump usually means the model latched onto something else nearby.
+const MAX_CENTER_JUMP_FRAC = 0.6;
+// Max allowed box area ratio change (new/old or old/new) between updates.
+// A sudden 2x+ size change usually means a different object was picked up.
+const MAX_AREA_RATIO_CHANGE = 2.0;
+let lastBoxDiagonal = null;  // in proc-canvas px, for jump-distance comparison
+let lastBoxArea = null;      // in proc-canvas px^2, for area-ratio comparison
+
+function isPlausibleUpdate(info){
+  if (!lastBoxDiagonal || !lastBoxArea) return true; // first lock, nothing to compare
+  const newCx = (info.minX + info.maxX) / 2;
+  const newCy = (info.minY + info.maxY) / 2;
+  const oldCx = lastCenter.x * info.w;
+  const oldCy = lastCenter.y * info.h;
+  const jump = Math.hypot(newCx - oldCx, newCy - oldCy);
+  const newArea = (info.maxX - info.minX) * (info.maxY - info.minY);
+  const areaRatio = Math.max(newArea / lastBoxArea, lastBoxArea / newArea);
+
+  if (jump > lastBoxDiagonal * MAX_CENTER_JUMP_FRAC) return false;
+  if (areaRatio > MAX_AREA_RATIO_CHANGE) return false;
+  return true;
+}
+
 function setStatus(state){
   statusPill.classList.remove('locked', 'searching', 'lost');
   if (state === 'locked'){ statusPill.textContent = 'ЗАХВАЧЕН'; statusPill.classList.add('locked'); }
@@ -399,7 +425,7 @@ function drawLockBracket(minX, minY, maxX, maxY, procW, procH, state){
   overlayCtx.lineWidth = 1;
   overlayCtx.strokeRect(x, y, w, h);
 
-  // center crosshair tick
+  // center crosshair tick (small, part of the technical HUD framing)
   const ccx = x + w/2, ccy = y + h/2;
   overlayCtx.strokeStyle = color;
   overlayCtx.lineWidth = 1;
@@ -408,12 +434,53 @@ function drawLockBracket(minX, minY, maxX, maxY, procW, procH, state){
   overlayCtx.moveTo(ccx, ccy - 6); overlayCtx.lineTo(ccx, ccy + 6);
   overlayCtx.stroke();
 
+  // Persistent amber anchor marker — placed at the same tracked center as the
+  // box, so it automatically "stays pinned" to the object in the world as the
+  // camera moves (it inherits the box's motion, including the lerp smoothing
+  // and the plausibility guards from trackLoop). While locked it's drawn at
+  // reduced opacity so it reads as a steady world-anchor rather than a fresh
+  // tap indicator; while searching/lost it pulses to signal uncertainty.
+  drawAnchorMarker(ccx, ccy, state);
+
   // dimension readout tag under the box
   overlayCtx.font = '10px "JetBrains Mono", monospace';
   overlayCtx.fillStyle = color;
   overlayCtx.textBaseline = 'top';
   const label = `${Math.round(w)}×${Math.round(h)}`;
   overlayCtx.fillText(label, x, y + h + 6);
+}
+
+let anchorPulsePhase = 0;
+
+function drawAnchorMarker(cx, cy, state){
+  const amber = '#E8A34D';
+  let alpha, radius;
+
+  if (state === 'locked'){
+    alpha = 0.4;
+    radius = 9;
+  } else {
+    // gentle pulse while searching/lost, so the marker still reads as "live"
+    anchorPulsePhase += 0.12;
+    const pulse = (Math.sin(anchorPulsePhase) + 1) / 2; // 0..1
+    alpha = 0.25 + pulse * 0.35;
+    radius = 9 + pulse * 4;
+  }
+
+  overlayCtx.save();
+  overlayCtx.globalAlpha = alpha;
+  overlayCtx.fillStyle = amber;
+  overlayCtx.beginPath();
+  overlayCtx.arc(cx, cy, radius, 0, Math.PI * 2);
+  overlayCtx.fill();
+
+  overlayCtx.globalAlpha = Math.min(1, alpha + 0.25);
+  overlayCtx.strokeStyle = amber;
+  overlayCtx.lineWidth = 1.5;
+  overlayCtx.beginPath();
+  overlayCtx.arc(cx, cy, radius, 0, Math.PI * 2);
+  overlayCtx.stroke();
+  overlayCtx.restore();
 }
 
 async function runSegmentation(normX, normY){
@@ -462,6 +529,8 @@ async function captureAt(viewportX, viewportY){
   const cy = (info.minY + info.maxY) / 2;
   lastCenter = { x: cx / info.w, y: cy / info.h };
   lastMaskBounds = info;
+  lastBoxDiagonal = Math.hypot(info.maxX - info.minX, info.maxY - info.minY);
+  lastBoxArea = (info.maxX - info.minX) * (info.maxY - info.minY);
   tracking = true;
   resetBtn.style.display = 'block';
   document.getElementById('topLabel').textContent = 'ОБЪЕКТ ЗАХВАЧЕН';
@@ -493,11 +562,25 @@ async function trackLoop(timestamp){
         const { x, y, w, h } = smoothBox;
         drawLockBracket(x, y, x + w, y + h, overlayCanvas.width, overlayCanvas.height, 'lost');
       }
+    } else if (!isPlausibleUpdate(info)){
+      // Segmenter likely latched onto a different object — hold the last
+      // known good box (shown in amber "searching" color) instead of
+      // snapping to the implausible new region. lastCenter is intentionally
+      // NOT updated, so the next run retries from the same anchor point.
+      setStatus('searching');
+      debugLine.textContent = `отклонён скачок: area=${(info.areaFrac*100).toFixed(0)}% (не похоже на тот же объект)`;
+      if (smoothBox){
+        overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+        const { x, y, w, h } = smoothBox;
+        drawLockBracket(x, y, x + w, y + h, overlayCanvas.width, overlayCanvas.height, 'searching');
+      }
     } else {
       const cx = (info.minX + info.maxX) / 2;
       const cy = (info.minY + info.maxY) / 2;
       lastCenter = { x: cx / info.w, y: cy / info.h };
       lastMaskBounds = info;
+      lastBoxDiagonal = Math.hypot(info.maxX - info.minX, info.maxY - info.minY);
+      lastBoxArea = (info.maxX - info.minX) * (info.maxY - info.minY);
       setStatus('locked');
       debugLine.textContent = `value=${info.targetVal}, area=${(info.areaFrac*100).toFixed(0)}%, box=${info.maxX-info.minX}×${info.maxY-info.minY}px`;
 
@@ -513,6 +596,8 @@ function resetCapture(){
   tracking = false;
   lastCenter = null;
   lastMaskBounds = null;
+  lastBoxDiagonal = null;
+  lastBoxArea = null;
   smoothBox = null;
   resetBtn.style.display = 'none';
   document.getElementById('topLabel').textContent = 'КОСНИТЕСЬ ОБЪЕКТА ДЛЯ ЗАХВАТА';
