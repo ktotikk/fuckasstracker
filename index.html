@@ -269,27 +269,18 @@ async function initSegmenter(){
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
   );
 
-  // Try GPU delegate first — WebGL-backed inference on the phone's GPU is
-  // reported to run several times faster than the CPU/WASM path (roughly
-  // 10-15 FPS on CPU vs 60+ FPS on GPU for comparable MediaPipe vision
-  // models). Some browsers/devices don't support it, so fall back to CPU
-  // if creation throws.
-  try {
-    segmenter = await InteractiveSegmenter.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
-      outputCategoryMask: true,
-      outputConfidenceMasks: false
-    });
-    usingGpuDelegate = true;
-  } catch (e){
-    console.warn('GPU delegate unavailable, falling back to CPU', e);
-    segmenter = await InteractiveSegmenter.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
-      outputCategoryMask: true,
-      outputConfidenceMasks: false
-    });
-    usingGpuDelegate = false;
-  }
+  // NOTE: GPU delegate was tried here for speed, but MediaPipe's GPU path is
+  // known to scramble/corrupt category mask values on some devices — the
+  // symptom is the entire frame reading back as a single category (100%
+  // area), which is exactly the "captured whole screen" bug this caused.
+  // CPU delegate is slower but returns correct mask values, so we use it
+  // unconditionally until GPU mask correctness can be verified per-device.
+  segmenter = await InteractiveSegmenter.createFromOptions(vision, {
+    baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+    outputCategoryMask: true,
+    outputConfidenceMasks: false
+  });
+  usingGpuDelegate = false;
 
   loadStatus.textContent = `Модель загружена (${usingGpuDelegate ? 'GPU' : 'CPU'})`;
   startBtn.disabled = false;
@@ -494,7 +485,7 @@ function drawAnchorMarker(cx, cy, state){
     alpha = 0.4;
     radius = 9;
   } else {
-    // gentle pulse while searching/lost, so the marker still reads as "live" meoww
+    // gentle pulse while searching/lost, so the marker still reads as "live"
     anchorPulsePhase += 0.12;
     const pulse = (Math.sin(anchorPulsePhase) + 1) / 2; // 0..1
     alpha = 0.25 + pulse * 0.35;
