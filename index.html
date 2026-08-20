@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Трекер</title>
+<title>Трекер объекта</title>
 <style>
   :root{
     --bg: #0A0C0B;
@@ -148,8 +148,8 @@
     <canvas id="overlayCanvas"></canvas>
 
     <div id="startOverlay">
-      <div class="mark">//ТРЕКЕР ОБЪЕКТА</div>
-      <h1>Обводка и слежение</h1>
+      <div class="mark">// AI-ТРЕКЕР ОБЪЕКТА</div>
+      <h1>Обводка и слежение по нейросети</h1>
       <p>Коснитесь объекта на видео — модель сегментации найдёт его границы и будет следить за ним.</p>
       <button id="startBtn">Включить камеру</button>
       <div id="loadStatus"></div>
@@ -161,14 +161,14 @@
       <div class="corner tr"></div>
       <div class="corner bl"></div>
       <div class="corner br"></div>
-      <div id="topLabel">ВЫБ ДЛЯ ЗХВ</div>
-      <div id="statusPill">НЕ ЗХВ</div>
+      <div id="topLabel">КОСНИТЕСЬ ОБЪЕКТА ДЛЯ ЗАХВАТА</div>
+      <div id="statusPill">НЕ ЗАХВАЧЕН</div>
 
       <div id="tapLayer">
         <div class="crosshair-tap" id="tapMark"></div>
       </div>
 
-      <button id="resetBtn">СБР ЗХВ</button>
+      <button id="resetBtn">Сбросить захват</button>
       <div id="debugLine"></div>
     </div>
   </div>
@@ -205,13 +205,25 @@ const maskCanvas = document.getElementById('maskCanvas');
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/1/magic_touch.tflite";
 
 let segmenter = null;
+let usingGpuDelegate = false;
 let tracking = false;
 let searching = false;
 let lastCenter = null;      // {x, y} normalized 0..1, in video-processing-frame space
 let lastMaskBounds = null;  // bounding box of the mask, in processing canvas px
 let trackRAF = null;
 let lastRunTime = 0;
-const RUN_INTERVAL_MS = 220; // throttle segmentation calls for perf
+
+// Instead of a fixed guess, we measure how long segment() actually takes on
+// this device and adapt the polling interval to it: run again shortly after
+// the previous call finishes, with a small safety margin, rather than
+// blindly waiting a fixed 220ms regardless of real hardware speed.
+let lastInferenceMs = 220; // seed value until we have a real measurement
+const INFERENCE_SAFETY_MARGIN_MS = 30; // small buffer so calls don't queue up back-to-back
+const MIN_INTERVAL_MS = 60;  // floor, so even a very fast device doesn't hammer the CPU/GPU
+const MAX_INTERVAL_MS = 600; // ceiling, so a very slow device still updates periodically
+function currentIntervalMs(){
+  return Math.min(MAX_INTERVAL_MS, Math.max(MIN_INTERVAL_MS, lastInferenceMs + INFERENCE_SAFETY_MARGIN_MS));
+}
 
 // --- Stability guards against the segmenter locking onto a different object ---
 // Max allowed center jump between consecutive tracking updates, as a fraction
@@ -223,6 +235,10 @@ const MAX_CENTER_JUMP_FRAC = 0.6;
 const MAX_AREA_RATIO_CHANGE = 2.0;
 let lastBoxDiagonal = null;  // in proc-canvas px, for jump-distance comparison
 let lastBoxArea = null;      // in proc-canvas px^2, for area-ratio comparison
+
+function perfSuffix(){
+  return ` | ${usingGpuDelegate ? 'GPU' : 'CPU'} ${lastInferenceMs.toFixed(0)}мс → интервал ${currentIntervalMs().toFixed(0)}мс`;
+}
 
 function isPlausibleUpdate(info){
   if (!lastBoxDiagonal || !lastBoxArea) return true; // first lock, nothing to compare
@@ -241,10 +257,10 @@ function isPlausibleUpdate(info){
 
 function setStatus(state){
   statusPill.classList.remove('locked', 'searching', 'lost');
-  if (state === 'locked'){ statusPill.textContent = 'ЗХВ'; statusPill.classList.add('locked'); }
+  if (state === 'locked'){ statusPill.textContent = 'ЗАХВАЧЕН'; statusPill.classList.add('locked'); }
   else if (state === 'searching'){ statusPill.textContent = 'ПОИСК...'; statusPill.classList.add('searching'); }
   else if (state === 'lost'){ statusPill.textContent = 'ПОТЕРЯН'; statusPill.classList.add('lost'); }
-  else { statusPill.textContent = 'НЕ ЗХВ'; }
+  else { statusPill.textContent = 'НЕ ЗАХВАЧЕН'; }
 }
 
 async function initSegmenter(){
@@ -252,12 +268,21 @@ async function initSegmenter(){
   const vision = await FilesetResolver.forVisionTasks(
     "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
   );
+
+  // NOTE: GPU delegate was tried here for speed, but MediaPipe's GPU path is
+  // known to scramble/corrupt category mask values on some devices — the
+  // symptom is the entire frame reading back as a single category (100%
+  // area), which is exactly the "captured whole screen" bug this caused.
+  // CPU delegate is slower but returns correct mask values, so we use it
+  // unconditionally until GPU mask correctness can be verified per-device.
   segmenter = await InteractiveSegmenter.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: MODEL_URL },
+    baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
     outputCategoryMask: true,
     outputConfidenceMasks: false
   });
-  loadStatus.textContent = 'Модель загружена';
+  usingGpuDelegate = false;
+
+  loadStatus.textContent = `Модель загружена (${usingGpuDelegate ? 'GPU' : 'CPU'})`;
   startBtn.disabled = false;
 }
 
@@ -487,15 +512,23 @@ async function runSegmentation(normX, normY){
   if (!segmenter) return null;
   if (!drawVideoToProcCanvas()) return null;
 
+  const t0 = performance.now();
+
   return new Promise((resolve) => {
     try {
       segmenter.segment(procCanvas, { keypoint: { x: normX, y: normY } }, (result) => {
+        const elapsed = performance.now() - t0;
+        // Smooth the measurement (simple exponential moving average) so a
+        // single slow/fast outlier frame doesn't swing the interval wildly.
+        lastInferenceMs = lastInferenceMs * 0.7 + elapsed * 0.3;
+
         const maskObj = result && result.categoryMask;
         if (!maskObj){ resolve(null); return; }
         const w = maskObj.width, h = maskObj.height;
         const data = maskObj.getAsUint8Array ? maskObj.getAsUint8Array() : maskObj.getAsFloat32Array();
         const info = findMaskBoundsAndContour(data, w, h, normX, normY);
         maskObj.close && maskObj.close();
+        if (info && !info.failed) info.inferenceMs = elapsed;
         resolve(info);
       });
     } catch (e){
@@ -523,7 +556,7 @@ async function captureAt(viewportX, viewportY){
     return;
   }
 
-  debugLine.textContent = `value=${info.targetVal}, area=${(info.areaFrac*100).toFixed(0)}%, box=${info.maxX-info.minX}×${info.maxY-info.minY}px @${info.w}×${info.h}`;
+  debugLine.textContent = `value=${info.targetVal}, area=${(info.areaFrac*100).toFixed(0)}%, box=${info.maxX-info.minX}×${info.maxY-info.minY}px @${info.w}×${info.h}` + perfSuffix();
 
   const cx = (info.minX + info.maxX) / 2;
   const cy = (info.minY + info.maxY) / 2;
@@ -546,7 +579,7 @@ async function captureAt(viewportX, viewportY){
 async function trackLoop(timestamp){
   if (!tracking){ trackRAF = null; return; }
 
-  if (timestamp - lastRunTime >= RUN_INTERVAL_MS && !searching){
+  if (timestamp - lastRunTime >= currentIntervalMs() && !searching){
     lastRunTime = timestamp;
     searching = true;
     const info = await runSegmentation(lastCenter.x, lastCenter.y);
@@ -582,7 +615,7 @@ async function trackLoop(timestamp){
       lastBoxDiagonal = Math.hypot(info.maxX - info.minX, info.maxY - info.minY);
       lastBoxArea = (info.maxX - info.minX) * (info.maxY - info.minY);
       setStatus('locked');
-      debugLine.textContent = `value=${info.targetVal}, area=${(info.areaFrac*100).toFixed(0)}%, box=${info.maxX-info.minX}×${info.maxY-info.minY}px`;
+      debugLine.textContent = `value=${info.targetVal}, area=${(info.areaFrac*100).toFixed(0)}%, box=${info.maxX-info.minX}×${info.maxY-info.minY}px` + perfSuffix();
 
       overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
       drawLockBracket(info.minX, info.minY, info.maxX, info.maxY, info.w, info.h, 'locked');
