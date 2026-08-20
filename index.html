@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Трекер объекта</title>
+<title>Трекер</title>
 <style>
   :root{
     --bg: #0A0C0B;
@@ -148,8 +148,8 @@
     <canvas id="overlayCanvas"></canvas>
 
     <div id="startOverlay">
-      <div class="mark">// AI-ТРЕКЕР ОБЪЕКТА</div>
-      <h1>Обводка и слежение по нейросети</h1>
+      <div class="mark">//ТРЕКЕР ОБЪЕКТА</div>
+      <h1>Обводка и слежение</h1>
       <p>Коснитесь объекта на видео — модель сегментации найдёт его границы и будет следить за ним.</p>
       <button id="startBtn">Включить камеру</button>
       <div id="loadStatus"></div>
@@ -161,14 +161,14 @@
       <div class="corner tr"></div>
       <div class="corner bl"></div>
       <div class="corner br"></div>
-      <div id="topLabel">КОСНИТЕСЬ ОБЪЕКТА ДЛЯ ЗАХВАТА</div>
-      <div id="statusPill">НЕ ЗАХВАЧЕН</div>
+      <div id="topLabel">ВЫБ ДЛЯ ЗХВ</div>
+      <div id="statusPill">НЕ ЗХВ</div>
 
       <div id="tapLayer">
         <div class="crosshair-tap" id="tapMark"></div>
       </div>
 
-      <button id="resetBtn">Сбросить захват</button>
+      <button id="resetBtn">СБР ЗХВ</button>
       <div id="debugLine"></div>
     </div>
   </div>
@@ -241,10 +241,10 @@ function isPlausibleUpdate(info){
 
 function setStatus(state){
   statusPill.classList.remove('locked', 'searching', 'lost');
-  if (state === 'locked'){ statusPill.textContent = 'ЗАХВАЧЕН'; statusPill.classList.add('locked'); }
+  if (state === 'locked'){ statusPill.textContent = 'ЗХВ'; statusPill.classList.add('locked'); }
   else if (state === 'searching'){ statusPill.textContent = 'ПОИСК...'; statusPill.classList.add('searching'); }
   else if (state === 'lost'){ statusPill.textContent = 'ПОТЕРЯН'; statusPill.classList.add('lost'); }
-  else { statusPill.textContent = 'НЕ ЗАХВАЧЕН'; }
+  else { statusPill.textContent = 'НЕ ЗХВ'; }
 }
 
 async function initSegmenter(){
