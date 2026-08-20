@@ -305,10 +305,7 @@ function findMaskBoundsAndContour(maskData, w, h){
 }
 
 function traceContourPoints(bin, w, h){
-  // Simple boundary extraction: for each foreground pixel, keep it if any
-  // 4-neighbor is background (or out of bounds). Produces a point cloud we
-  // then draw as small segments — sufficient for a live outline without a
-  // full marching-squares implementation.
+  // kept only for potential future use; not called by the bracket-style HUD
   const pts = [];
   for (let y = 0; y < h; y++){
     for (let x = 0; x < w; x++){
@@ -326,26 +323,74 @@ function traceContourPoints(bin, w, h){
   return pts;
 }
 
-function drawOutline(contourPts, procW, procH, color){
-  const vw = overlayCanvas.width, vh = overlayCanvas.height;
-  const sx = vw / procW, sy = vh / procH;
-  overlayCtx.fillStyle = color;
-  for (let i = 0; i < contourPts.length; i += 2){
-    const x = contourPts[i] * sx, y = contourPts[i+1] * sy;
-    overlayCtx.fillRect(x - 0.75, y - 0.75, 1.5, 1.5);
-  }
-}
+// Smoothing state for the lock box so it doesn't jitter between segmentation runs
+let smoothBox = null; // {x, y, w, h} in viewport px
+const SMOOTH = 0.35; // lerp factor toward new box each update
 
-function drawBoundingBox(minX, minY, maxX, maxY, procW, procH){
+function lerp(a, b, t){ return a + (b - a) * t; }
+
+function drawLockBracket(minX, minY, maxX, maxY, procW, procH, state){
   const vw = overlayCanvas.width, vh = overlayCanvas.height;
   const sx = vw / procW, sy = vh / procH;
-  const x = minX * sx, y = minY * sy;
-  const w = (maxX - minX) * sx, h = (maxY - minY) * sy;
-  overlayCtx.strokeStyle = 'rgba(159,232,112,0.55)';
+  const targetBox = {
+    x: minX * sx, y: minY * sy,
+    w: (maxX - minX) * sx, h: (maxY - minY) * sy
+  };
+
+  if (!smoothBox){
+    smoothBox = targetBox;
+  } else {
+    smoothBox = {
+      x: lerp(smoothBox.x, targetBox.x, SMOOTH),
+      y: lerp(smoothBox.y, targetBox.y, SMOOTH),
+      w: lerp(smoothBox.w, targetBox.w, SMOOTH),
+      h: lerp(smoothBox.h, targetBox.h, SMOOTH)
+    };
+  }
+
+  const { x, y, w, h } = smoothBox;
+  const color = state === 'lost' ? '#E0645A' : (state === 'searching' ? '#E8A34D' : '#9FE870');
+  const armLen = Math.max(14, Math.min(w, h) * 0.22);
+
+  overlayCtx.strokeStyle = color;
+  overlayCtx.lineWidth = 2;
+  overlayCtx.lineCap = 'square';
+
+  // four corner brackets — classic HUD lock-on style
+  const corners = [
+    [x, y, 1, 1],               // top-left: arms go right & down
+    [x + w, y, -1, 1],          // top-right: arms go left & down
+    [x, y + h, 1, -1],          // bottom-left: arms go right & up
+    [x + w, y + h, -1, -1]      // bottom-right: arms go left & up
+  ];
+  corners.forEach(([cx, cy, dx, dy]) => {
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(cx, cy + dy * armLen);
+    overlayCtx.lineTo(cx, cy);
+    overlayCtx.lineTo(cx + dx * armLen, cy);
+    overlayCtx.stroke();
+  });
+
+  // faint full outline so the box reads clearly at a glance
+  overlayCtx.strokeStyle = state === 'lost' ? 'rgba(224,100,90,0.25)' : 'rgba(159,232,112,0.22)';
   overlayCtx.lineWidth = 1;
-  overlayCtx.setLineDash([4, 4]);
   overlayCtx.strokeRect(x, y, w, h);
-  overlayCtx.setLineDash([]);
+
+  // center crosshair tick
+  const ccx = x + w/2, ccy = y + h/2;
+  overlayCtx.strokeStyle = color;
+  overlayCtx.lineWidth = 1;
+  overlayCtx.beginPath();
+  overlayCtx.moveTo(ccx - 6, ccy); overlayCtx.lineTo(ccx + 6, ccy);
+  overlayCtx.moveTo(ccx, ccy - 6); overlayCtx.lineTo(ccx, ccy + 6);
+  overlayCtx.stroke();
+
+  // dimension readout tag under the box
+  overlayCtx.font = '10px "JetBrains Mono", monospace';
+  overlayCtx.fillStyle = color;
+  overlayCtx.textBaseline = 'top';
+  const label = `${Math.round(w)}×${Math.round(h)}`;
+  overlayCtx.fillText(label, x, y + h + 6);
 }
 
 async function runSegmentation(normX, normY){
@@ -392,9 +437,8 @@ async function captureAt(viewportX, viewportY){
   setStatus('locked');
 
   overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-  const contour = traceContourPoints(info.bin, info.w, info.h);
-  drawOutline(contour, info.w, info.h, 'rgba(159,232,112,0.9)');
-  drawBoundingBox(info.minX, info.minY, info.maxX, info.maxY, info.w, info.h);
+  smoothBox = null; // snap fresh on new capture, no lerp from a stale box
+  drawLockBracket(info.minX, info.minY, info.maxX, info.maxY, info.w, info.h, 'locked');
 
   if (!trackRAF) trackRAF = requestAnimationFrame(trackLoop);
 }
@@ -410,6 +454,11 @@ async function trackLoop(timestamp){
 
     if (!info){
       setStatus('lost');
+      if (smoothBox){
+        overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+        const { x, y, w, h } = smoothBox;
+        drawLockBracket(x, y, x + w, y + h, overlayCanvas.width, overlayCanvas.height, 'lost');
+      }
     } else {
       const cx = (info.minX + info.maxX) / 2;
       const cy = (info.minY + info.maxY) / 2;
@@ -418,9 +467,7 @@ async function trackLoop(timestamp){
       setStatus('locked');
 
       overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-      const contour = traceContourPoints(info.bin, info.w, info.h);
-      drawOutline(contour, info.w, info.h, 'rgba(159,232,112,0.9)');
-      drawBoundingBox(info.minX, info.minY, info.maxX, info.maxY, info.w, info.h);
+      drawLockBracket(info.minX, info.minY, info.maxX, info.maxY, info.w, info.h, 'locked');
     }
   }
 
@@ -431,6 +478,7 @@ function resetCapture(){
   tracking = false;
   lastCenter = null;
   lastMaskBounds = null;
+  smoothBox = null;
   resetBtn.style.display = 'none';
   document.getElementById('topLabel').textContent = 'КОСНИТЕСЬ ОБЪЕКТА ДЛЯ ЗАХВАТА';
   setStatus('idle');
