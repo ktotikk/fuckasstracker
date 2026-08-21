@@ -461,6 +461,13 @@ function computePixelsPerDegree(){
   pixelsPerDegree = viewport.clientWidth / ASSUMED_HFOV_DEG;
 }
 
+// Small per-frame angle changes are sensor noise, not real phone rotation —
+// a phone sitting still still reports jittery ~0.05-0.3° deltas between
+// deviceorientation events. Applying those uncorrected accumulates into a
+// slow but visible drift over a few seconds even with zero actual motion,
+// which was the main cause of the box wandering off a stationary object.
+const GYRO_DEADZONE_DEG = 0.4;
+
 function handleOrientation(e){
   if (e.alpha === null) return; // some browsers fire null-filled events before real data arrives
   if (gyroAlpha !== null){
@@ -469,7 +476,10 @@ function handleOrientation(e){
     if (dAlpha < -180) dAlpha += 360;
     let dBeta = e.beta - gyroBeta;
 
-    if (tracking && smoothBox && pixelsPerDegree){
+    if (Math.abs(dAlpha) < GYRO_DEADZONE_DEG) dAlpha = 0;
+    if (Math.abs(dBeta) < GYRO_DEADZONE_DEG) dBeta = 0;
+
+    if (tracking && smoothBox && pixelsPerDegree && (dAlpha !== 0 || dBeta !== 0)){
       smoothBox.x += -dAlpha * pixelsPerDegree;
       smoothBox.y += dBeta * pixelsPerDegree;
     }
@@ -598,6 +608,20 @@ function drawLockBracket(minX, minY, maxX, maxY, procW, procH, state){
 
 function renderBoxFromSmooth(state){
   if (!smoothBox) return;
+
+  // Safety net: whatever the source (gyro nudge, coast extrapolation,
+  // lerp overshoot), never let the box drift fully off-screen. Clamp its
+  // center to stay within the visible viewport, with a small margin so it
+  // can still visibly approach an edge without vanishing entirely.
+  const vw = overlayCanvas.width, vh = overlayCanvas.height;
+  const margin = 20;
+  const boxCx = smoothBox.x + smoothBox.w / 2;
+  const boxCy = smoothBox.y + smoothBox.h / 2;
+  const clampedCx = Math.min(vw - margin, Math.max(margin, boxCx));
+  const clampedCy = Math.min(vh - margin, Math.max(margin, boxCy));
+  smoothBox.x += clampedCx - boxCx;
+  smoothBox.y += clampedCy - boxCy;
+
   const { x, y, w, h } = smoothBox;
   const color = state === 'lost' ? '#E0645A' : (state === 'searching' ? '#E8A34D' : '#9FE870');
   const armLen = Math.max(14, Math.min(w, h) * 0.22);
@@ -895,17 +919,15 @@ async function trackLoop(timestamp){
       drawLockBracket(info.minX, info.minY, info.maxX, info.maxY, info.w, info.h, 'locked');
     }
   } else if (smoothBox){
-    // Between inference calls: gyro compensation already nudged smoothBox
-    // directly inside handleOrientation(). Here we additionally apply the
-    // velocity-based coast so translation (not just rotation) is predicted
-    // too — e.g. an object moving steadily across the frame.
-    if (lastConfirmedCenter){
-      const dtFrame = 16; // approx one frame at 60fps, in ms
-      const vw = overlayCanvas.width, vh = overlayCanvas.height;
-      const scaleX = vw / procCanvas.width, scaleY = vh / procCanvas.height;
-      smoothBox.x += velocity.x * dtFrame * scaleX;
-      smoothBox.y += velocity.y * dtFrame * scaleY;
-    }
+    // Between inference calls: gyro compensation nudges smoothBox directly
+    // inside handleOrientation() (now deadzoned against sensor noise). We
+    // deliberately do NOT also apply the raw velocity estimate here as a
+    // per-frame translation — doing so compounded with gyro nudges and any
+    // small noise in the velocity estimate accumulated into visible drift
+    // even when the object was nearly stationary. The velocity estimate is
+    // still computed on every confirmed result (see updateVelocityFromConfirmed)
+    // and used by coastPrediction() specifically during dropouts/rejections,
+    // where extrapolating is actually useful rather than harmful.
     const state = statusPill.classList.contains('lost') ? 'lost'
                 : statusPill.classList.contains('searching') ? 'searching' : 'locked';
     renderBoxFromSmooth(state);
@@ -915,9 +937,19 @@ async function trackLoop(timestamp){
 }
 
 function coastPrediction(state){
-  // Decay velocity slightly each time we coast through a dropout, so a
-  // stale estimate doesn't carry the box off-screen indefinitely if the
-  // object has actually stopped or the track is genuinely lost.
+  // Apply one step of velocity-based extrapolation, then decay the
+  // velocity so a stale estimate doesn't carry the box away indefinitely
+  // if the object has actually stopped or the track is genuinely lost.
+  // This only runs during dropouts/rejections (called from trackLoop's
+  // failure branches), not on every normal frame — that distinction is
+  // what keeps it from compounding into drift during ordinary tracking.
+  if (smoothBox && lastConfirmedCenter){
+    const dtFrame = 16;
+    const vw = overlayCanvas.width, vh = overlayCanvas.height;
+    const scaleX = vw / procCanvas.width, scaleY = vh / procCanvas.height;
+    smoothBox.x += velocity.x * dtFrame * scaleX;
+    smoothBox.y += velocity.y * dtFrame * scaleY;
+  }
   velocity = { x: velocity.x * VELOCITY_DECAY_PER_FRAME, y: velocity.y * VELOCITY_DECAY_PER_FRAME };
   if (smoothBox){
     renderBoxFromSmooth(state);
