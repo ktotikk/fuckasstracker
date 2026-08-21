@@ -202,6 +202,13 @@ const procCanvas = document.getElementById('procCanvas');
 const procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
 const maskCanvas = document.getElementById('maskCanvas');
 
+// Offscreen canvas used to hold just the cropped region-of-interest (ROI)
+// around the currently tracked object, so segment() only has to process a
+// small area instead of the full frame once we already know roughly where
+// the object is. Not attached to the DOM — created purely in memory.
+const roiCanvas = document.createElement('canvas');
+const roiCtx = roiCanvas.getContext('2d', { willReadFrequently: true });
+
 const MODEL_URL = "https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/1/magic_touch.tflite";
 
 let segmenter = null;
@@ -239,7 +246,8 @@ let lastBoxArea = null;      // in proc-canvas px^2, for area-ratio comparison
 
 function perfSuffix(){
   const gyroTxt = gyroSupported ? (gyroAvailable ? 'гироскоп: активен' : 'гироскоп: ожидание') : 'гироскоп: недоступен';
-  return ` | CPU${simdSupported ? '+SIMD' : ''} ${lastInferenceMs.toFixed(0)}мс → интервал ${currentIntervalMs().toFixed(0)}мс | ${gyroTxt}`;
+  const accelTxt = accelSupported ? (accelAvailable ? (inSuddenMotionWindow() ? 'акселерометр: РЫВОК' : 'акселерометр: активен') : 'акселерометр: ожидание') : 'акселерометр: недоступен';
+  return ` | CPU${simdSupported ? '+SIMD' : ''} ${lastInferenceMs.toFixed(0)}мс → интервал ${currentIntervalMs().toFixed(0)}мс | ${gyroTxt} | ${accelTxt}`;
 }
 
 function isPlausibleUpdate(info){
@@ -252,8 +260,16 @@ function isPlausibleUpdate(info){
   const newArea = (info.maxX - info.minX) * (info.maxY - info.minY);
   const areaRatio = Math.max(newArea / lastBoxArea, lastBoxArea / newArea);
 
-  if (jump > lastBoxDiagonal * MAX_CENTER_JUMP_FRAC) return false;
-  if (areaRatio > MAX_AREA_RATIO_CHANGE) return false;
+  // During a detected accelerometer jolt, a legitimate tracked object can
+  // legitimately jump further/faster on screen than normal handheld
+  // jitter — relax the guards so we don't falsely reject a real update
+  // and get stuck coasting through a moment where the object actually did
+  // move a lot.
+  const jumpFrac = inSuddenMotionWindow() ? MAX_CENTER_JUMP_FRAC * 2 : MAX_CENTER_JUMP_FRAC;
+  const areaRatioLimit = inSuddenMotionWindow() ? MAX_AREA_RATIO_CHANGE * 1.5 : MAX_AREA_RATIO_CHANGE;
+
+  if (jump > lastBoxDiagonal * jumpFrac) return false;
+  if (areaRatio > areaRatioLimit) return false;
   return true;
 }
 
@@ -314,6 +330,7 @@ async function startCamera(){
       startOverlay.style.display = 'none';
       hud.style.display = 'block';
       enableGyro();
+      enableAccelerometer();
     };
   } catch (err) {
     camError.style.display = 'block';
@@ -357,7 +374,7 @@ function viewportToProcNorm(x, y){
   return { x: x / viewport.clientWidth, y: y / viewport.clientHeight };
 }
 
-function findMaskBoundsAndContour(maskData, w, h, clickNormX, clickNormY){
+function findMaskBoundsAndContour(maskData, w, h, clickNormX, clickNormY, maxAreaFrac = 0.92){
   // The category mask's numeric meaning (which value = "selected object")
   // is not guaranteed to be 1— it depends on the model's category ordering
   // and on whether we're reading a Uint8Array ([0,255] winning-category index)
@@ -388,8 +405,12 @@ function findMaskBoundsAndContour(maskData, w, h, clickNormX, clickNormY){
   // Safety net: if the "matching" region is basically the whole frame
   // (e.g. tapped on background, or mask came back inverted/degenerate),
   // treat it as a failed capture rather than drawing a full-screen box.
+  // maxAreaFrac is relaxed by the caller when segmenting a tight ROI crop,
+  // where the object legitimately filling most of the crop is expected
+  // (that's the point of cropping close around it), not a sign of a
+  // degenerate/inverted mask like it would be on a full-frame capture.
   const areaFrac = count / (w * h);
-  if (areaFrac > 0.92 || count === 0) return { failed: true, targetVal, areaFrac, w, h };
+  if (areaFrac > maxAreaFrac || count === 0) return { failed: true, targetVal, areaFrac, w, h };
 
   return { bin, minX, minY, maxX, maxY, count, w, h, targetVal, areaFrac };
 }
@@ -467,6 +488,67 @@ function enableGyro(){
   } else {
     window.addEventListener('deviceorientation', handleOrientation);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Accelerometer — "sudden motion" trigger (NOT direct displacement tracking)
+// ---------------------------------------------------------------------------
+// We deliberately do NOT try to compute pixel displacement by double-
+// integrating accelerometer data (accel -> velocity -> position). MEMS
+// accelerometers in phones are noisy and have a small bias; double
+// integration turns that noise into drift that grows with the square of
+// time, so within a couple of seconds an estimated position can be
+// meters off even if the phone never moved. That's a fundamentally harder
+// problem (real inertial navigation needs sensor fusion — Kalman filters,
+// visual references, etc.) and not worth attempting here.
+//
+// Instead we use the accelerometer for something it's actually reliable
+// at: detecting THAT a sudden, sharp motion happened, right now. When the
+// magnitude of linear acceleration spikes above a threshold, we (a)
+// temporarily relax the plausibility guards, since a legitimate object can
+// jump further/faster on screen during a camera jolt, and (b) force the
+// next segmentation to run immediately instead of waiting out the normal
+// interval, so we re-acquire the real position sooner after the jolt
+// rather than continuing to coast on a stale velocity estimate.
+let accelSupported = ('DeviceMotionEvent' in window);
+let accelAvailable = false;
+let suddenMotionUntil = 0; // performance.now() timestamp; guards relaxed until this time
+const ACCEL_JOLT_THRESHOLD = 12; // m/s^2, empirical — normal handheld jitter stays well below this
+const SUDDEN_MOTION_RELAX_MS = 500; // how long to keep guards relaxed after a detected jolt
+
+function handleMotion(e){
+  // Prefer acceleration with gravity removed if the browser provides it;
+  // fall back to includingGravity (gravity is roughly constant, so a sudden
+  // spike still shows up as a delta, just riding on a ~9.8 baseline).
+  const a = e.acceleration && e.acceleration.x !== null ? e.acceleration : e.accelerationIncludingGravity;
+  if (!a || a.x === null) return;
+  const magnitude = Math.hypot(a.x || 0, a.y || 0, a.z || 0);
+  accelAvailable = true;
+
+  const baseline = e.acceleration ? 0 : 9.8; // rough gravity offset if using includingGravity
+  if (Math.abs(magnitude - baseline) > ACCEL_JOLT_THRESHOLD){
+    suddenMotionUntil = performance.now() + SUDDEN_MOTION_RELAX_MS;
+    if (tracking){
+      // Force the tracking loop to re-run inference on its very next tick
+      // instead of waiting for currentIntervalMs() to elapse.
+      lastRunTime = 0;
+    }
+  }
+}
+
+function enableAccelerometer(){
+  if (!accelSupported) return;
+  if (typeof DeviceMotionEvent.requestPermission === 'function'){
+    DeviceMotionEvent.requestPermission().then(state => {
+      if (state === 'granted') window.addEventListener('devicemotion', handleMotion);
+    }).catch(() => {});
+  } else {
+    window.addEventListener('devicemotion', handleMotion);
+  }
+}
+
+function inSuddenMotionWindow(){
+  return performance.now() < suddenMotionUntil;
 }
 
 // ---------------------------------------------------------------------------
@@ -603,15 +685,75 @@ function drawAnchorMarker(cx, cy, state){
   overlayCtx.restore();
 }
 
-async function runSegmentation(normX, normY){
+// ---------------------------------------------------------------------------
+// Region-of-interest (ROI) cropping
+// ---------------------------------------------------------------------------
+// Once an object is locked, we already know roughly where it is (lastCenter
+// + lastBoxDiagonal from the previous confirmed result). Instead of handing
+// the model the entire proc-canvas frame every time — most of which is
+// background the model has to re-scan for no reason — we crop a square
+// region around the last known position and segment only that. This both
+// cuts down the pixels the model's own internal resize has to chew through
+// per call, and structurally prevents it from "jumping" to an unrelated
+// object far away in the frame, since that object is no longer even in the
+// data we send it.
+const ROI_SIZE_MULTIPLIER = 3; // ROI side length = this × last box diagonal
+const ROI_MIN_SIZE_FRAC = 0.35; // ROI is never smaller than this fraction of the proc-canvas width
+const ROI_MAX_SIZE_FRAC = 1.0;  // ROI never exceeds the full frame (falls back to full-frame segmentation)
+
+function computeRoiRect(){
+  if (!lastCenter || !lastBoxDiagonal) return null; // no prior lock — nothing to crop around
+  const pw = procCanvas.width, ph = procCanvas.height;
+  const minSide = pw * ROI_MIN_SIZE_FRAC;
+  const maxSide = Math.min(pw, ph) * ROI_MAX_SIZE_FRAC;
+  // During a detected sudden-motion window, widen the search area since the
+  // object may have moved further on screen than normal handheld jitter
+  // would — same reasoning as relaxing the plausibility guards above.
+  const sizeMultiplier = inSuddenMotionWindow() ? ROI_SIZE_MULTIPLIER * 1.8 : ROI_SIZE_MULTIPLIER;
+  let side = Math.min(maxSide, Math.max(minSide, lastBoxDiagonal * sizeMultiplier));
+
+  const cx = lastCenter.x * pw, cy = lastCenter.y * ph;
+  let x = cx - side / 2, y = cy - side / 2;
+  // Clamp to frame bounds without shrinking the ROI, so it stays a
+  // consistent size near the edges instead of getting cut off.
+  x = Math.max(0, Math.min(pw - side, x));
+  y = Math.max(0, Math.min(ph - side, y));
+  return { x, y, side };
+}
+
+async function runSegmentation(normX, normY, roiRect){
   if (!segmenter) return null;
   if (!drawVideoToProcCanvas()) return null;
 
   const t0 = performance.now();
 
+  // Decide what to actually hand the model: the full proc-canvas frame
+  // (first capture, or when no ROI is available/appropriate), or a cropped
+  // square around the last known object position.
+  let targetCanvas = procCanvas;
+  let roiOffsetX = 0, roiOffsetY = 0, roiScale = 1;
+
+  if (roiRect){
+    const side = Math.round(roiRect.side);
+    if (roiCanvas.width !== side || roiCanvas.height !== side){
+      roiCanvas.width = side;
+      roiCanvas.height = side;
+    }
+    roiCtx.drawImage(procCanvas, roiRect.x, roiRect.y, side, side, 0, 0, side, side);
+    targetCanvas = roiCanvas;
+    roiOffsetX = roiRect.x;
+    roiOffsetY = roiRect.y;
+    // normX/normY were computed against the full proc-canvas; re-express
+    // them as normalized coordinates within the ROI crop instead.
+    normX = (normX * procCanvas.width - roiOffsetX) / side;
+    normY = (normY * procCanvas.height - roiOffsetY) / side;
+    normX = Math.min(1, Math.max(0, normX));
+    normY = Math.min(1, Math.max(0, normY));
+  }
+
   return new Promise((resolve) => {
     try {
-      segmenter.segment(procCanvas, { keypoint: { x: normX, y: normY } }, (result) => {
+      segmenter.segment(targetCanvas, { keypoint: { x: normX, y: normY } }, (result) => {
         const elapsed = performance.now() - t0;
         // Smooth the measurement (simple exponential moving average) so a
         // single slow/fast outlier frame doesn't swing the interval wildly.
@@ -619,11 +761,39 @@ async function runSegmentation(normX, normY){
 
         const maskObj = result && result.categoryMask;
         if (!maskObj){ resolve(null); return; }
-        const w = maskObj.width, h = maskObj.height;
+        const mw = maskObj.width, mh = maskObj.height;
         const data = maskObj.getAsUint8Array ? maskObj.getAsUint8Array() : maskObj.getAsFloat32Array();
-        const info = findMaskBoundsAndContour(data, w, h, normX, normY);
+        // Pass the ROI-local click point so findMaskBoundsAndContour samples
+        // the correct pixel; results come back in ROI-mask pixel space.
+        const clickNormX = roiRect ? normX : normX;
+        const clickNormY = roiRect ? normY : normY;
+        const maxAreaFrac = roiRect ? 0.97 : 0.92;
+        const info = findMaskBoundsAndContour(data, mw, mh, clickNormX, clickNormY, maxAreaFrac);
         maskObj.close && maskObj.close();
-        if (info && !info.failed) info.inferenceMs = elapsed;
+
+        if (info && !info.failed){
+          info.inferenceMs = elapsed;
+          if (roiRect){
+            // Translate ROI-mask-pixel bounds back into full proc-canvas
+            // pixel space: mask px -> ROI px (via roiRect.side / mask size)
+            // -> full-frame px (add roiOffset).
+            const scaleToRoiPx = roiRect.side / mw; // assumes square mask, matches square ROI
+            info.minX = info.minX * scaleToRoiPx + roiOffsetX;
+            info.maxX = info.maxX * scaleToRoiPx + roiOffsetX;
+            info.minY = info.minY * scaleToRoiPx + roiOffsetY;
+            info.maxY = info.maxY * scaleToRoiPx + roiOffsetY;
+            info.w = procCanvas.width;
+            info.h = procCanvas.height;
+            info.usedRoi = true;
+            info.roiSide = Math.round(roiRect.side);
+          } else {
+            info.usedRoi = false;
+          }
+        } else if (info && info.failed){
+          info.usedRoi = !!roiRect;
+          info.roiSide = roiRect ? Math.round(roiRect.side) : null;
+        }
+
         resolve(info);
       });
     } catch (e){
@@ -682,7 +852,18 @@ async function trackLoop(timestamp){
   if (dueForInference){
     lastRunTime = timestamp;
     searching = true;
-    const info = await runSegmentation(lastCenter.x, lastCenter.y);
+    const roiRect = computeRoiRect();
+    let info = await runSegmentation(lastCenter.x, lastCenter.y, roiRect);
+
+    // If a tight ROI crop failed to find the object, it may simply have
+    // moved further than the crop covers (e.g. after a fast pan or a
+    // rejected jump on the previous frame). Retry once against the full
+    // frame before giving up — this costs one extra full-frame inference
+    // occasionally, but avoids permanently losing the object just because
+    // the crop was too tight for a larger-than-expected motion.
+    if (roiRect && (!info || info.failed)){
+      info = await runSegmentation(lastCenter.x, lastCenter.y, null);
+    }
     searching = false;
 
     if (!info || info.failed){
@@ -708,7 +889,8 @@ async function trackLoop(timestamp){
       lastBoxArea = (info.maxX - info.minX) * (info.maxY - info.minY);
       updateVelocityFromConfirmed(cx, cy);
       setStatus('locked');
-      debugLine.textContent = `value=${info.targetVal}, area=${(info.areaFrac*100).toFixed(0)}%, box=${info.maxX-info.minX}×${info.maxY-info.minY}px` + perfSuffix();
+      const roiTxt = info.usedRoi ? `ROI ${info.roiSide}px` : 'полный кадр';
+      debugLine.textContent = `value=${info.targetVal}, area=${(info.areaFrac*100).toFixed(0)}%, box=${info.maxX-info.minX}×${info.maxY-info.minY}px, ${roiTxt}` + perfSuffix();
 
       drawLockBracket(info.minX, info.minY, info.maxX, info.maxY, info.w, info.h, 'locked');
     }
@@ -751,6 +933,7 @@ function resetCapture(){
   smoothBox = null;
   velocity = { x: 0, y: 0 };
   lastConfirmedCenter = null;
+  suddenMotionUntil = 0;
   resetBtn.style.display = 'none';
   document.getElementById('topLabel').textContent = 'КОСНИТЕСЬ ОБЪЕКТА ДЛЯ ЗАХВАТА';
   setStatus('idle');
